@@ -188,23 +188,34 @@ def render_changes_html(display: pd.DataFrame, delta_raw: pd.Series, fund_id: st
         + f"<tbody>{rows}</tbody></table>"
     )
 
-def render_snapshot_html(df: pd.DataFrame, fund_id: str) -> str:
+def render_snapshot_html(df: pd.DataFrame, fund_id: str, price_map=None) -> str:
+    show_pct = price_map is not None
     rows = ""
     for _, row in df.iterrows():
         flag = get_flag(row["代號"]) if fund_id == "00988A" else ""
         flag_str = f"{flag} " if flag else ""
+        pct_cell = ""
+        if show_pct:
+            pct = price_map.get(str(row["代號"]).strip())
+            if pct is not None:
+                cls = "pos" if pct > 0 else ("neg" if pct < 0 else "")
+                pct_cell = f"<td class='{cls}'>{pct:+.2f}%</td>"
+            else:
+                pct_cell = "<td>－</td>"
         rows += (
             f"<tr>"
             f"<td>{row['代號']}</td>"
             f"<td>{flag_str}{row['名稱']}</td>"
             f"<td>{row['權重']:.2f}%</td>"
             f"<td>{int(row['股數']):,}</td>"
+            f"{pct_cell}"
             f"</tr>"
         )
+    th_pct = "<th>漲幅</th>" if show_pct else ""
     return (
         TABLE_STYLE
         + "<table class='etf-table'>"
-        + "<thead><tr><th>代號</th><th>名稱</th><th>權重</th><th>股數</th></tr></thead>"
+        + f"<thead><tr><th>代號</th><th>名稱</th><th>權重</th><th>股數</th>{th_pct}</tr></thead>"
         + f"<tbody>{rows}</tbody></table>"
     )
 
@@ -326,6 +337,66 @@ def get_etf_market_data(fund_id: str, date_str: str) -> dict:
     return result
 
 
+@st.cache_data(ttl=1800)
+def get_tw_price_map() -> dict:
+    """一次抓 TWSE + TPEX 所有股票當日漲幅%，回傳 {ticker: 漲幅%}"""
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    kw = {"headers": {"User-Agent": "Mozilla/5.0"}, "timeout": 10, "verify": False}
+    result = {}
+
+    # TWSE 上市
+    try:
+        r = requests.get(
+            "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?response=json&type=ALLBUT0999",
+            **kw,
+        )
+        if r.ok:
+            for table in r.json().get("tables", []):
+                fields = table.get("fields", [])
+                if "證券代號" not in fields or "收盤價" not in fields:
+                    continue
+                fi = {f: i for i, f in enumerate(fields)}
+                for row in table.get("data", []):
+                    try:
+                        ticker = row[fi["證券代號"]].strip()
+                        close  = float(row[fi["收盤價"]].replace(",", ""))
+                        sign   = row[fi["漲跌(+/-)"]].strip()
+                        diff   = float(row[fi["漲跌價差"]].replace(",", ""))
+                        if sign == "-":
+                            diff = -diff
+                        prev = close - diff
+                        if prev > 0:
+                            result[ticker] = round(diff / prev * 100, 2)
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+
+    # TPEX 上櫃
+    try:
+        r2 = requests.get(
+            "https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/"
+            "stk_wn1430_result.php?l=zh-tw&o=json&se=EW",
+            **kw,
+        )
+        if r2.ok:
+            for row in r2.json().get("aaData", []):
+                try:
+                    ticker = row[0].strip()
+                    close  = float(row[2].replace(",", ""))
+                    diff   = float(row[3].replace(",", ""))
+                    prev   = close - diff
+                    if prev > 0:
+                        result[ticker] = round(diff / prev * 100, 2)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    return result
+
+
 # ── 頁面設定 ──────────────────────────────────────
 st.set_page_config(
     page_title="ezMoneySniper",
@@ -373,6 +444,9 @@ if "premium" in mkt:
     )
 else:
     c3.metric("折溢價", "－")
+
+# ── 台股漲幅（Tab2/Tab3 共用，00988A 不適用）────────
+price_map = get_tw_price_map() if fund_id != "00988A" else None
 
 # ── Tab 佈局 ──────────────────────────────────────
 tab1, tab2, tab3, tab4 = st.tabs(["📊 當日異動", "🏆 前十大持股", "📋 完整持倉", "📈 歷史紀錄"])
@@ -456,7 +530,7 @@ with tab2:
         col_t1.metric("前十大權重合計", f"{top10_weight:.2f}%")
         col_t2.metric("佔基金總權重", f"{concentration:.1f}%")
 
-        st.markdown(render_snapshot_html(df_top10, fund_id), unsafe_allow_html=True)
+        st.markdown(render_snapshot_html(df_top10, fund_id, price_map), unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════
 # Tab 3：完整持倉快照
@@ -484,7 +558,7 @@ with tab3:
         col_s2.metric("權重加總", f"{df_snap['權重'].sum():.2f}%")
 
         st.markdown(
-            render_snapshot_html(df_snap, fund_id),
+            render_snapshot_html(df_snap, fund_id, price_map),
             unsafe_allow_html=True,
         )
 
